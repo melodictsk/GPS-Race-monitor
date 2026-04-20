@@ -15,16 +15,33 @@ MicroNMEA nmea(nmeaBuffer, sizeof(nmeaBuffer));
 
 String device_name = "WiFiBTGPS";
 
-// Nordic UART Service (NUS) UUIDs — standard for BLE-UART bridges
+// ---- Service A: Nordic UART (NUS) -- for BLE terminals / raw NMEA passthrough ----
 #define BLE_UART_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define BLE_UART_RX_CHAR_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E" // write from client -> ESP
 #define BLE_UART_TX_CHAR_UUID "6E400003-B5A3-F393-E0A9-E50E24DCCA9E" // notify ESP -> client
 
+// ---- Service B: RaceChrono DIY BLE GPS (service 0x1FF8) ----
+// Only GPS characteristics (0x0003 main, 0x0004 time) are implemented.
+// CAN-Bus 0x0001/0x0002 are NOT exposed — the user must configure the device
+// in RaceChrono with only the "GPS" checkbox enabled.
+#define BLE_RC_SERVICE_UUID    "00001ff8-0000-1000-8000-00805f9b34fb"
+#define BLE_RC_GPS_MAIN_UUID   "00000003-0000-1000-8000-00805f9b34fb"
+#define BLE_RC_GPS_TIME_UUID   "00000004-0000-1000-8000-00805f9b34fb"
+
 BLEServer*         bleServer     = nullptr;
-BLECharacteristic* bleTxChar     = nullptr;
-BLECharacteristic* bleRxChar     = nullptr;
+BLECharacteristic* bleTxChar     = nullptr;  // NUS TX
+BLECharacteristic* bleRxChar     = nullptr;  // NUS RX
+BLECharacteristic* bleRcMainChar = nullptr;  // RaceChrono 0x0003
+BLECharacteristic* bleRcTimeChar = nullptr;  // RaceChrono 0x0004
 bool               bleConnected  = false;
 bool               bleWasConnected = false;
+
+// Sync bits (3-bit counter, shared between 0x0003 and 0x0004, increments every
+// time the time-packet value changes).
+uint8_t  rcSyncBits = 0;
+// Previous encoded time packet (24-bit, held in a uint32_t) — used to decide
+// when to bump sync bits and re-notify 0x0004.
+uint32_t rcPrevTimePacket = 0xFFFFFFFF;
 
 // Buffer for data received from BLE client -> forwarded to Serial1
 #define BLE_RX_BUF_SIZE 1024
@@ -36,18 +53,9 @@ volatile size_t bleRxTail = 0;  // read by loop
 #define MAX_SRV_CLIENTS 2
 const char *ssid = "WiFiBTGPS";
 const char *password = "87654321";
-String GPShour;
-String GPSmin;
-String GPSsec;
-String GPSsats;
-String GPSspd="-";
-uint8_t phour, pmin, psec, psats, lhour, lmin, lsec, lsats;
-int lspd;
 uint8_t i;
 NetworkServer server(23);
 NetworkClient serverClients[MAX_SRV_CLIENTS];
-String bat;
-int tbat;
 
 // Variables for tracking min/max speed on segments
 float minSpeedSegment = 0.0;
@@ -139,26 +147,44 @@ int    deltaSpeed = 0;        // current speed delta vs best lap (+ = faster)
 bool   deltaValid = false;    // do we have a valid comparison?
 int    bestLapSearchIdx = 0;  // last matched index in bestLap (monotonic search)
 
-// Function prototypes
-void processSerialData();
-void handleTelnetClients();
-void updateSpeedTracking();
-void updateDisplay();
-void updateDisplayTime();
-void updateDisplaySats();
-void updateDisplaySpeed();
-void updateDisplayMinMax();
-void updateDisplayBottom();
-void reportSegmentStatus(String trendType, float currentSpeed, float currentGPSTime);
-float getCurrentGPSTime();
-void handleButton();
-void setFinishLine();
-void checkLineCrossing();
-void recordCurrentLapPoint();
-void updateDeltaComparison();
-double crossProduct2D(double ax, double ay, double bx, double by);
-String formatLapTime(float seconds);
-String formatDeltaTime(float seconds);
+// ==================== RTOS ====================
+// Mutex protecting the MicroNMEA object and all variables derived from it
+SemaphoreHandle_t nmeaMutex = nullptr;
+// Mutex protecting the SPI bus / st7735 display — must be held for every draw call
+SemaphoreHandle_t spiMutex  = nullptr;
+
+// Ring buffer: GPS task -> BLE TX task (NMEA passthrough)
+// Large enough for a few seconds of 115200 baud NMEA bursts
+#define BLE_TX_BUF_SIZE 4096
+static uint8_t  bleTxBuf[BLE_TX_BUF_SIZE];
+static volatile size_t bleTxHead = 0;  // written by GPS task
+static volatile size_t bleTxTail = 0;  // read by BLE task
+
+void bleTxEnqueue(const uint8_t* data, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    size_t next = (bleTxHead + 1) % BLE_TX_BUF_SIZE;
+    if (next == bleTxTail) break;  // full — drop
+    bleTxBuf[bleTxHead] = data[i];
+    bleTxHead = next;
+  }
+}
+
+// FreeRTOS queue: GPS task -> WiFi task (по одному байту, потокобезопасно)
+#define WIFI_TX_BUF_SIZE 4096
+static QueueHandle_t wifiTxQueue = nullptr;
+
+void wifiTxEnqueue(const uint8_t* data, size_t len) {
+  if (wifiTxQueue == nullptr) return;
+  for (size_t i = 0; i < len; i++) {
+    xQueueSend(wifiTxQueue, &data[i], 0);
+  }
+}
+
+// Task handles
+TaskHandle_t taskGPS         = nullptr;
+TaskHandle_t taskWiFi        = nullptr;
+TaskHandle_t taskBLE         = nullptr;
+TaskHandle_t taskDisplay     = nullptr;
 
 
 float getCurrentGPSTime() {
@@ -687,34 +713,17 @@ void updateDisplayBottom() {
 }
 
 void updateDisplayBat() {
-  int currentBat = analogReadMilliVolts(1);
-  
-  if (currentBat != tbat) {
-    tbat = currentBat;
-    // Linear mapping: 3.3V (3300 mV) -> 0%, 4.1V (4100 mV) -> 100%
-    // Formula: ((V - 3300) / 800) * 100 = (V - 3300) / 8
-    int percent = (tbat*5 - 3300) / 8;
-    if (percent < 0) percent = 0;
-    if (percent > 100) percent = 100;
-    uint16_t color;
-    if (percent >= 50) {
-      color = ST7735_WHITE;
-    } else if (percent >= 20) {
-      color = ST7735_YELLOW;
-    } else {
-      color = ST7735_RED;
-    }
-    bat = "B:" + String(percent)+"% ";
-    st7735.st7735_write_str(66, 0, bat, Font_7x10, color);
-  }
+  int percent = (analogReadMilliVolts(1) * 5 - 3300) / 8;
+  if (percent < 0) percent = 0;
+  if (percent > 100) percent = 100;
+  uint16_t color;
+  if (percent >= 50)      color = ST7735_WHITE;
+  else if (percent >= 20) color = ST7735_YELLOW;
+  else                    color = ST7735_RED;
+  st7735.st7735_write_str(66, 0, "B:" + String(percent) + "% ", Font_7x10, color);
 }
 
 void updateWirelessStatus() {
-  // Cached previous states so we only redraw on change (no flicker)
-  static int8_t lastWifiActive = -1; // -1 = never drawn, 0 = inactive, 1 = active
-  static int8_t lastBleActive  = -1;
-
-  // Wi-Fi is "active" if an STA is associated to our AP OR a telnet client is connected
   bool wifiActive = (WiFi.softAPgetStationNum() > 0);
   if (!wifiActive) {
     for (uint8_t k = 0; k < MAX_SRV_CLIENTS; k++) {
@@ -725,103 +734,46 @@ void updateWirelessStatus() {
     }
   }
 
-  int8_t wifiState = wifiActive ? 1 : 0;
-  int8_t bleState  = bleConnected ? 1 : 0;
-
-  if (wifiState != lastWifiActive) {
-    uint16_t c = wifiActive ? ST7735_GREEN : ST7735_GRAY;
-    st7735.st7735_write_str(112, 0, "W", Font_7x10, c);
-    lastWifiActive = wifiState;
-  }
-
-  if (bleState != lastBleActive) {
-    uint16_t c = bleConnected ? ST7735_CYAN : ST7735_GRAY;
-    st7735.st7735_write_str(119, 0, "B", Font_7x10, c);
-    lastBleActive = bleState;
-  }
+  uint16_t cw = wifiActive  ? ST7735_GREEN : ST7735_GRAY;
+  uint16_t cb = bleConnected ? ST7735_CYAN  : ST7735_GRAY;
+  st7735.st7735_write_str(112, 0, "W", Font_7x10, cw);
+  st7735.st7735_write_str(119, 0, "B", Font_7x10, cb);
 }
 
 void updateDisplayTime() {
-  if (lsec == nmea.getSecond()) return;
-
-  if (nmea.getHour() < 10) GPShour = "0" + (String)int(nmea.getHour());
-  else GPShour = (String)int(nmea.getHour());
-  if (nmea.getMinute() < 10) GPSmin = "0" + (String)int(nmea.getMinute());
-  else GPSmin = (String)int(nmea.getMinute());
-  if (nmea.getSecond() < 10) GPSsec = "0" + (String)int(nmea.getSecond());
-  else GPSsec = (String)int(nmea.getSecond());
-
-  String time_str = GPShour + ":" + GPSmin + ":" + GPSsec;
-  st7735.st7735_write_str(3, 0, time_str, Font_7x10, ST7735_WHITE);
-  lsec = nmea.getSecond();
-
-  updateDisplayBat(); //One update per second
-  updateWirelessStatus();
+  char buf[9];
+  snprintf(buf, sizeof(buf), "%02d:%02d:%02d",
+           nmea.getHour(), nmea.getMinute(), nmea.getSecond());
+  st7735.st7735_write_str(3, 0, String(buf), Font_7x10, ST7735_WHITE);
 }
 
 void updateDisplaySats() {
-  if (lsats == nmea.getNumSatellites()) return;
-
-  if (nmea.getNumSatellites() < 10) GPSsats = "S:0" + (String)int(nmea.getNumSatellites());
-  else GPSsats = "S:" + (String)int(nmea.getNumSatellites());
-  if (nmea.isValid()) st7735.st7735_write_str(131, 0, GPSsats, Font_7x10, ST7735_GREEN);
-  else st7735.st7735_write_str(131, 0, GPSsats, Font_7x10, ST7735_RED);
-  lsats = nmea.getNumSatellites();
+  if (!gpsEverValid) {
+    st7735.st7735_write_str(131, 0, "S:00", Font_7x10, ST7735_RED);
+    return;
+  }
+  char buf[5];
+  snprintf(buf, sizeof(buf), "S:%02d", nmea.getNumSatellites());
+  uint16_t color = nmea.isValid() ? ST7735_GREEN : ST7735_RED;
+  st7735.st7735_write_str(131, 0, String(buf), Font_7x10, color);
 }
 
 void updateDisplaySpeed() {
-  // Don't draw speed until GPS has been valid at least once —
-  // otherwise the first iterations render garbage in red.
-  if (!gpsEverValid) return;
-
-  int spd = nmea.getSpeed() * 1.852 / 1000;
-  bool valid = nmea.isValid();
-  static bool lvalid = false;
-
-  if (spd == lspd && valid == lvalid) return;
-
-  uint16_t color = valid ? ST7735_WHITE : ST7735_RED;
-  if (spd > 999) spd=999;
-  GPSspd = (String)spd;
-  if (spd < 100)  GPSspd = " "  + (String)spd;
-  if (spd < 10)   GPSspd = "  " + (String)spd;
-  st7735.st7735_write_str2(55, 12, GPSspd, Font_16x26, color);
-  lspd = spd;
-  lvalid = valid;
+  int spd = constrain((int)(nmea.getSpeed() * 1.852 / 1000), 0, 999);
+  char buf[5];
+  snprintf(buf, sizeof(buf), "%3d", spd);
+  uint16_t color = nmea.isValid() ? ST7735_WHITE : ST7735_RED;
+  st7735.st7735_write_str2(55, 11, String(buf), Font_16x26, color);
 }
 
 void updateDisplayMinMax() {
-  static float lmax = -1.0;
-  static float lmin = -1.0;
-
-  if (maxSpeedSegment != lmax) {
-    int vmax = (int)maxSpeedSegment;
-    String smax;
-    if      (vmax < 10)  smax = "  " + String(vmax, DEC);
-    else if (vmax < 100) smax = " "  + String(vmax, DEC);
-    else                 smax = String(vmax, DEC);
-    st7735.st7735_write_str(4, 12, smax, Font_16x26, ST7735_WHITE);
-    lmax = maxSpeedSegment;
-  }
-
-  if (minSpeedSegment != lmin) {
-    int vmin = (int)minSpeedSegment;
-    String smin;
-    if      (vmin < 10)  smin = "  " + String(vmin, DEC);
-    else if (vmin < 100) smin = " "  + String(vmin, DEC);
-    else                 smin = String(vmin, DEC);
-    st7735.st7735_write_str(4, 38, smin, Font_16x26, ST7735_WHITE);
-    lmin = minSpeedSegment;
-  }
-}
-
-void updateDisplay() {
-  updateDisplayTime();
-  updateDisplaySats();
-  updateDisplaySpeed();
-  updateDisplayMinMax();
-  updateDisplayBottom();
-
+  auto fmt = [](int v) -> String {
+    if (v < 10)  return "  " + String(v, DEC);
+    if (v < 100) return " "  + String(v, DEC);
+    return String(v, DEC);
+  };
+  st7735.st7735_write_str(4, 12, fmt((int)maxSpeedSegment), Font_16x26, ST7735_WHITE);
+  st7735.st7735_write_str(4, 38, fmt((int)minSpeedSegment), Font_16x26, ST7735_WHITE);
 }
 
 void processSerialData() {
@@ -833,22 +785,18 @@ void processSerialData() {
       size_t len = Serial1.available();  //1
       uint8_t rbuf[len];
       Serial1.readBytes(rbuf, len);
-      Serial.write(rbuf, len);
+      if (Serial) Serial.write(rbuf, len);
 
-      // same data that goes to Serial and telnet clients — also goes to the BLE client
-      bleNotifyBytes(rbuf, len);
-
-      for (i = 0; i < MAX_SRV_CLIENTS; i++) {
-        if (serverClients[i] && serverClients[i].connected()) {
-          serverClients[i].write(rbuf, len);
-        }
-      }
+      // queue for BLE TX task — does not block GPS task
+      bleTxEnqueue(rbuf, len);
+      // queue for WiFi TX task — does not block GPS task
+      wifiTxEnqueue(rbuf, len);
       
       for (i = 0; i < len; i++) {
         nmea.process(rbuf[i]);
       }
     }
-      if (Serial.available()) {
+    if (Serial && Serial.available()) {
       size_t len = Serial.available();
       uint8_t sbuf[len];
       Serial.readBytes(sbuf, len);
@@ -905,33 +853,25 @@ void handleTelnetClients() {
   if (server.hasClient()) {
     for (i = 0; i < MAX_SRV_CLIENTS; i++) {
       if (!serverClients[i] || !serverClients[i].connected()) {
-        if (serverClients[i]) {
-          serverClients[i].stop();
-        }
+        if (serverClients[i]) serverClients[i].stop();
         serverClients[i] = server.accept();
         break;
       }
     }
-    if (i >= MAX_SRV_CLIENTS) {
-      server.accept().stop();
-    }
+    if (i >= MAX_SRV_CLIENTS) server.accept().stop();
   }
 
+  // Read from clients -> Serial1 (non-blocking)
   for (i = 0; i < MAX_SRV_CLIENTS; i++) {
     if (serverClients[i] && serverClients[i].connected()) {
-      if (serverClients[i].available()) {
-        while (serverClients[i].available()) {
-          size_t len = serverClients[i].available();
-          uint8_t sbuf[len];
-          serverClients[i].readBytes(sbuf, len);
-          Serial.write(sbuf, len);
-          Serial1.write(sbuf, len);
-        }
+      while (serverClients[i].available()) {
+        size_t len = serverClients[i].available();
+        uint8_t sbuf[len];
+        serverClients[i].readBytes(sbuf, len);
+        Serial1.write(sbuf, len);
       }
     } else {
-      if (serverClients[i]) {
-        serverClients[i].stop();
-      }
+      if (serverClients[i]) serverClients[i].stop();
     }
   }
 }
@@ -968,27 +908,57 @@ class BleRxCallbacks : public BLECharacteristicCallbacks {
 
 void initBLE() {
   BLEDevice::init(device_name.c_str());
+  // Request a larger MTU up-front. RaceChrono still uses 20-byte payloads per
+  // spec, but a bigger MTU helps NUS throughput for NMEA streaming.
+  BLEDevice::setMTU(247);
+
   bleServer = BLEDevice::createServer();
   bleServer->setCallbacks(new BleServerCallbacks());
 
-  BLEService* svc = bleServer->createService(BLE_UART_SERVICE_UUID);
+  // ---- Service A: Nordic UART (NMEA passthrough) ----
+  BLEService* nus = bleServer->createService(BLE_UART_SERVICE_UUID);
 
-  // TX (notify ESP -> client)
-  bleTxChar = svc->createCharacteristic(
+  bleTxChar = nus->createCharacteristic(
       BLE_UART_TX_CHAR_UUID,
       BLECharacteristic::PROPERTY_NOTIFY);
   bleTxChar->addDescriptor(new BLE2902());
 
-  // RX (write client -> ESP)
-  bleRxChar = svc->createCharacteristic(
+  bleRxChar = nus->createCharacteristic(
       BLE_UART_RX_CHAR_UUID,
       BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
   bleRxChar->setCallbacks(new BleRxCallbacks());
 
-  svc->start();
+  nus->start();
 
+  // ---- Service B: RaceChrono DIY (GPS only) ----
+  BLEService* rc = bleServer->createService(BLE_RC_SERVICE_UUID);
+
+  bleRcMainChar = rc->createCharacteristic(
+      BLE_RC_GPS_MAIN_UUID,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  bleRcMainChar->addDescriptor(new BLE2902());
+
+  bleRcTimeChar = rc->createCharacteristic(
+      BLE_RC_GPS_TIME_UUID,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  bleRcTimeChar->addDescriptor(new BLE2902());
+
+  // Prime both characteristics with "invalid" values so the first READ from the
+  // app returns something sane before the first GPS fix arrives.
+  {
+    uint8_t empty[20];
+    memset(empty, 0xFF, sizeof(empty));
+    bleRcMainChar->setValue(empty, 20);
+    uint8_t emptyTime[3] = {0xFF, 0xFF, 0xFF};
+    bleRcTimeChar->setValue(emptyTime, 3);
+  }
+
+  rc->start();
+
+  // Advertise BOTH service UUIDs so clients can find either NUS or RaceChrono.
   BLEAdvertising* adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(BLE_UART_SERVICE_UUID);
+  adv->addServiceUUID(BLE_RC_SERVICE_UUID);
   adv->setScanResponse(true);
   adv->setMinPreferred(0x06);
   adv->setMinPreferred(0x12);
@@ -1021,6 +991,181 @@ void drainBleRxToSerial1() {
   }
 }
 
+// ==================== RaceChrono DIY BLE encoder ====================
+//
+// Encodes the current NMEA fix into the two RaceChrono characteristics
+// (0x0003 main, 0x0004 time) per the spec at
+// https://github.com/aollin/racechrono-ble-diy-device
+//
+// All multi-byte values are big-endian and unsigned unless noted.
+
+// Pack a 24-bit value (sync<<21 | lower21) into dst[0..2], big-endian.
+static void rcPack24BE(uint8_t* dst, uint32_t v24) {
+  dst[0] = (uint8_t)((v24 >> 16) & 0xFF);
+  dst[1] = (uint8_t)((v24 >>  8) & 0xFF);
+  dst[2] = (uint8_t)( v24        & 0xFF);
+}
+
+static void rcPack16BE(uint8_t* dst, uint16_t v) {
+  dst[0] = (uint8_t)((v >> 8) & 0xFF);
+  dst[1] = (uint8_t)( v       & 0xFF);
+}
+
+static void rcPack32BE(uint8_t* dst, uint32_t v) {
+  dst[0] = (uint8_t)((v >> 24) & 0xFF);
+  dst[1] = (uint8_t)((v >> 16) & 0xFF);
+  dst[2] = (uint8_t)((v >>  8) & 0xFF);
+  dst[3] = (uint8_t)( v        & 0xFF);
+}
+
+// Build and notify the two RaceChrono characteristics with the latest NMEA data.
+// Called on every loop iteration — internally dedups by NMEA fix timestamp
+// so we don't re-notify the same fix.
+void updateRaceChronoCharacteristics() {
+  if (!bleConnected) return;
+  if (bleRcMainChar == nullptr || bleRcTimeChar == nullptr) return;
+  if (!nmea.isValid()) return;
+
+  // Dedup: skip if NMEA fix timestamp has not advanced since last call.
+  static uint32_t rcLastFixTime = 0xFFFFFFFF;
+  uint32_t fixTime = (uint32_t)nmea.getHour()       * 360000UL
+                   + (uint32_t)nmea.getMinute()     *   6000UL
+                   + (uint32_t)nmea.getSecond()     *    100UL
+                   + (uint32_t)nmea.getHundredths();
+  if (fixTime == rcLastFixTime) return;
+  rcLastFixTime = fixTime;
+
+  // ---- 0x0004: time packet (year/month/day/hour) -------------------------
+  // Check whether the hour or the date has changed. If yes — bump sync bits
+  // and re-notify 0x0004. 0x0003 is notified every time either way.
+  uint32_t timePkt21 = 0x1FFFFFu; // 21 bits set (invalid placeholder)
+  {
+    int y = nmea.getYear();
+    int m = nmea.getMonth();
+    int d = nmea.getDay();
+    int h = nmea.getHour();
+    if (y >= 2000 && m >= 1 && d >= 1) {
+      timePkt21 = (uint32_t)((y - 2000) * 8928
+                           + (m - 1)    * 744
+                           + (d - 1)    * 24
+                           +  h) & 0x1FFFFFu;
+    }
+  }
+
+  if (timePkt21 != rcPrevTimePacket) {
+    rcSyncBits = (rcSyncBits + 1) & 0x07;
+    rcPrevTimePacket = timePkt21;
+
+    uint32_t v24 = ((uint32_t)rcSyncBits << 21) | timePkt21;
+    uint8_t timeBuf[3];
+    rcPack24BE(timeBuf, v24);
+    bleRcTimeChar->setValue(timeBuf, 3);
+    bleRcTimeChar->notify();
+  }
+
+  // ---- 0x0003: main GPS packet (20 bytes) --------------------------------
+  uint8_t buf[20];
+
+  // bytes 0..2: sync bits (3) + time-from-hour-start (21 bits)
+  //   tfh = minute*30000 + second*500 + ms/2
+  uint32_t tfh;
+  {
+    int mm  = nmea.getMinute();
+    int ss  = nmea.getSecond();
+    int hnd = nmea.getHundredths();  // 0..99 (10 ms units)
+    int ms  = hnd * 10;              // milliseconds within the second
+    tfh = (uint32_t)(mm * 30000 + ss * 500 + ms / 2) & 0x1FFFFFu;
+  }
+  uint32_t hdr24 = ((uint32_t)rcSyncBits << 21) | tfh;
+  rcPack24BE(&buf[0], hdr24);
+
+  // byte 3: fix quality (2 bits) + locked satellites (6 bits, 0x3F = invalid)
+  uint8_t fixQ = 1;  // valid fix
+  uint8_t sats = 0x3F;
+  {
+    int n = nmea.getNumSatellites();
+    if (n >= 0 && n < 0x3F) sats = (uint8_t)n;
+  }
+  buf[3] = (uint8_t)(((fixQ & 0x03) << 6) | (sats & 0x3F));
+
+  // bytes 4..7: latitude, degrees * 1e7, signed int32 BE, 0x7FFFFFFF = invalid
+  // bytes 8..11: longitude, same
+  // MicroNMEA returns lat/lon in millionths of a degree (int32, deg*1e6).
+  // RaceChrono expects deg*1e7, so multiply by 10.
+  uint32_t latEnc;
+  uint32_t lonEnc;
+  {
+    int64_t lat1e7 = (int64_t)nmea.getLatitude()  * 10;
+    int64_t lon1e7 = (int64_t)nmea.getLongitude() * 10;
+    latEnc = (uint32_t)(int32_t)lat1e7;
+    lonEnc = (uint32_t)(int32_t)lon1e7;
+  }
+  rcPack32BE(&buf[4],  latEnc);
+  rcPack32BE(&buf[8],  lonEnc);
+
+  // bytes 12..13: altitude
+  //   primary:   ((m + 500) * 10) & 0x7FFF      (0.1 m resolution, -500..+6053.5)
+  //   fallback:  ((m + 500)      ) & 0x7FFF | 0x8000 (1 m resolution, wider range)
+  uint16_t altEnc = 0xFFFF;
+  {
+    long altMm;
+    if (nmea.getAltitude(altMm)) {
+      float altM = altMm / 1000.0f;
+      float shifted = altM + 500.0f;
+      if (shifted >= 0.0f && shifted <= 6053.5f) {
+        uint32_t v = (uint32_t)lroundf(shifted * 10.0f) & 0x7FFFu;
+        altEnc = (uint16_t)v;
+      } else {
+        int32_t vi = (int32_t)lroundf(shifted);
+        if (vi < 0) vi = 0;
+        altEnc = (uint16_t)((vi & 0x7FFF) | 0x8000);
+      }
+    }
+  }
+  rcPack16BE(&buf[12], altEnc);
+
+  // bytes 14..15: speed
+  //   primary:   (km/h * 100) & 0x7FFF       (0.01 km/h, 0..655.35)
+  //   fallback:  (km/h * 10)  & 0x7FFF | 0x8000
+  // MicroNMEA getSpeed() returns knots * 1000. Convert to km/h.
+  uint16_t spdEnc = 0xFFFF;
+  {
+    long spdMilliKnots = nmea.getSpeed();
+    if (spdMilliKnots >= 0) {
+      float kmh = (spdMilliKnots / 1000.0f) * 1.852f;
+      if (kmh <= 655.35f) {
+        uint32_t v = (uint32_t)lroundf(kmh * 100.0f) & 0x7FFFu;
+        spdEnc = (uint16_t)v;
+      } else {
+        uint32_t v = (uint32_t)lroundf(kmh * 10.0f) & 0x7FFFu;
+        spdEnc = (uint16_t)(v | 0x8000u);
+      }
+    }
+  }
+  rcPack16BE(&buf[14], spdEnc);
+
+  // bytes 16..17: bearing (degrees * 100), 0xFFFF = invalid
+  // MicroNMEA getCourse() returns degrees * 1000.
+  uint16_t brgEnc = 0xFFFF;
+  {
+    long crsMilliDeg = nmea.getCourse();
+    if (crsMilliDeg >= 0) {
+      uint32_t v = (uint32_t)((crsMilliDeg + 5) / 10) & 0xFFFFu;  // *100
+      if (v == 0xFFFF) v = 0xFFFE; // avoid collision with invalid marker
+      brgEnc = (uint16_t)v;
+    }
+  }
+  rcPack16BE(&buf[16], brgEnc);
+
+  // bytes 18..19: HDOP, VDOP (dop * 10). MicroNMEA does not expose these —
+  // send invalid markers.
+  buf[18] = 0xFF;
+  buf[19] = 0xFF;
+
+  bleRcMainChar->setValue(buf, 20);
+  bleRcMainChar->notify();
+}
+
 // Reconnection handling — after a disconnect we must restart advertising
 void handleBleReconnect() {
   if (!bleConnected && bleWasConnected) {
@@ -1036,48 +1181,179 @@ void handleBleReconnect() {
 void setup() {
   pinMode(VGNSS_CTRL, OUTPUT);
   digitalWrite(VGNSS_CTRL, HIGH);
-  
+
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  
+
   st7735.st7735_init();
   st7735_spi.setFrequency(27000000);
   st7735.st7735_fill_screen(ST7735_BLACK);
-  
+
   Serial.begin(115200);
   Serial1.begin(115200, SERIAL_8N1, 33, 34);
   Serial1.setRxBufferSize(1024);
-  
-  WiFi.softAP(ssid, password);
-  IPAddress myIP = WiFi.softAPIP();
 
+  analogReadResolution(12);
+  pinMode(2, OUTPUT);
+  digitalWrite(2, HIGH);
+
+  // Create mutex before starting tasks
+  nmeaMutex    = xSemaphoreCreateMutex();
+  spiMutex     = xSemaphoreCreateMutex();
+  wifiTxQueue  = xQueueCreate(WIFI_TX_BUF_SIZE, sizeof(uint8_t));
+
+  // WiFi + telnet server (must happen in setup, not in a task)
+  WiFi.softAP(ssid, password);
   server.begin();
   server.setNoDelay(true);
   st7735.st7735_write_str(0, 0, (String)"WiFiBTGPS     pass: 87654321 IP:192.168.4.1Port:23");
   delay(2500);
   st7735.st7735_fill_screen(ST7735_BLACK);
-  phour=0; pmin=0; psec=61; psats=0; lhour=0; lmin=0; lsec=61; lsats = 99; lspd=-1;
-
-    // Set the resolution of the analog-to-digital converter (ADC) to 12 bits (0-4095):
-  analogReadResolution(12);
-    // Set pin 2 as an output pin (used for ADC control):
-  pinMode(2, OUTPUT);
-  // Set pin 2 to HIGH (enable ADC control):
-  digitalWrite(2, HIGH);
 
   initBLE();
+
+  // ---- Spawn RTOS tasks ----
+  // GPS task: Core 1, highest priority — must drain Serial1 before HW buffer overflows
+  xTaskCreatePinnedToCore(taskGPSFn,     "GPS",     4096, nullptr, 4, &taskGPS,     1);
+  // WiFi/Telnet task: Core 0, medium priority
+  xTaskCreatePinnedToCore(taskWiFiFn,    "WiFi",    4096, nullptr, 2, &taskWiFi,    0);
+  // BLE reconnect task: Core 0, low priority (BLE stack itself has its own internal tasks)
+  xTaskCreatePinnedToCore(taskBLEFn,     "BLE",     3072, nullptr, 1, &taskBLE,     0);
+  // Display task: Core 0, low priority, strict 10 Hz via vTaskDelayUntil
+  xTaskCreatePinnedToCore(taskDisplayFn, "Display", 4096, nullptr, 1, &taskDisplay, 0);
 }
 
+// Arduino loop() is itself a FreeRTOS task — leave it suspended.
 void loop() {
-  processSerialData();
-  handleButton();
-  if (nmea.isValid()) {
-    if (!gpsEverValid) gpsEverValid = true;
-    updateSpeedTracking();
-    checkLineCrossing();
-    recordCurrentLapPoint();
-    updateDeltaComparison();
+  vTaskDelay(portMAX_DELAY);
+}
+
+// ==================== RTOS TASKS ====================
+
+// GPS task: reads Serial1 -> NMEA, forwards to BLE/WiFi, lap logic
+void taskGPSFn(void* pv) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xPeriod = pdMS_TO_TICKS(50);  // 20 Hz
+  while (true) {
+    // Forward Serial1 bytes, feed MicroNMEA, notify BLE/telnet
+    processSerialData();
+
+    // Button (debounced, cheap)
+    handleButton();
+
+    // GPS-derived logic — brief mutex hold
+    if (xSemaphoreTake(nmeaMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      if (nmea.isValid()) {
+        if (!gpsEverValid) gpsEverValid = true;
+        updateSpeedTracking();
+        checkLineCrossing();
+        recordCurrentLapPoint();
+        updateDeltaComparison();
+        updateRaceChronoCharacteristics();
+      }
+      xSemaphoreGive(nmeaMutex);
+    }
+
+    vTaskDelayUntil(&xLastWakeTime, xPeriod);
   }
-  handleTelnetClients();
-  updateDisplay();
-  handleBleReconnect();
+}
+
+// WiFi/Telnet task: 10 Hz
+void taskWiFiFn(void* pv) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xPeriod = pdMS_TO_TICKS(100);
+
+  while (true) {
+    if (server.hasClient()) {
+      for (uint8_t i = 0; i < MAX_SRV_CLIENTS; i++) {
+        if (!serverClients[i] || !serverClients[i].connected()) {
+          if (serverClients[i]) serverClients[i].stop();
+          serverClients[i] = server.accept();
+          serverClients[i].setTimeout(2000);  // 2 sec timeout
+          xQueueReset(wifiTxQueue);
+          break;
+        }
+      }
+    }
+
+    // Wifi clients -> Serial1
+    for (uint8_t i = 0; i < MAX_SRV_CLIENTS; i++) {
+      if (serverClients[i] && serverClients[i].connected()) {
+        while (serverClients[i].available()) {
+          size_t len = serverClients[i].available();
+          uint8_t sbuf[len];
+          serverClients[i].readBytes(sbuf, len);
+          Serial1.write(sbuf, len);
+        }
+      } else {
+        if (serverClients[i]) serverClients[i].stop();
+      }
+    }
+
+    uint8_t chunk[256];
+    size_t n = 0;
+    while (n < sizeof(chunk) && xQueueReceive(wifiTxQueue, &chunk[n], 0) == pdTRUE) n++;
+    if (n > 0) {
+      for (uint8_t i = 0; i < MAX_SRV_CLIENTS; i++) {
+        if (serverClients[i] && serverClients[i].connected()) {
+          serverClients[i].write(chunk, n);  // таймаут защитит от зависания
+        }
+      }
+    }
+
+    vTaskDelayUntil(&xLastWakeTime, xPeriod);
+  }
+}
+
+// BLE task: drains NMEA TX queue + handles reconnect
+void taskBLEFn(void* pv) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xPeriod = pdMS_TO_TICKS(100);  // 10 Hz
+
+  while (true) {
+    // Drain the NMEA passthrough queue into BLE notify chunks
+    while (bleTxTail != bleTxHead) {
+      // Gather up to CHUNK bytes contiguously
+      const size_t CHUNK = 180;
+      uint8_t chunk[CHUNK];
+      size_t n = 0;
+      while (n < CHUNK && bleTxTail != bleTxHead) {
+        chunk[n++] = bleTxBuf[bleTxTail];
+        bleTxTail = (bleTxTail + 1) % BLE_TX_BUF_SIZE;
+      }
+      bleNotifyBytes(chunk, n);
+    }
+
+    handleBleReconnect();
+    vTaskDelayUntil(&xLastWakeTime, xPeriod);
+  }
+}
+
+// Display task: exactly 10 Hz using vTaskDelayUntil
+// Single display task: 10 Hz fast updates, 1 Hz slow updates (every 10th tick)
+void taskDisplayFn(void* pv) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xPeriod = pdMS_TO_TICKS(100);  // 10 Hz
+  uint8_t slowTick = 0;
+
+  while (true) {
+    if (xSemaphoreTake(nmeaMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        // 10 Hz
+        updateDisplaySpeed();
+        updateDisplayMinMax();
+        updateDisplayBottom();
+        // 1 Hz
+        if (++slowTick >= 10) {
+          slowTick = 0;
+          updateDisplayBat();
+          updateDisplayTime();
+          updateDisplaySats();
+          updateWirelessStatus();
+        }
+        xSemaphoreGive(spiMutex);
+      }
+      xSemaphoreGive(nmeaMutex);
+    }
+    vTaskDelayUntil(&xLastWakeTime, xPeriod);
+  }
 }
